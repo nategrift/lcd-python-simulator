@@ -1,81 +1,137 @@
-#include <stdio.h>
+#include <string.h>
+#include <sys/param.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/uart.h"
-#include <math.h>
+#include "freertos/event_groups.h"
+#include "esp_system.h"
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "lwip/err.h"
+#include "lwip/sys.h"
+#include "lwip/netdb.h"
+#include "lwip/api.h"
 
-#define SCREEN_WIDTH  240
-#define SCREEN_HEIGHT 240
-#define BUFFER_SIZE 2048 
 
-// header that is same as python file
-uint8_t header[4] = {0xAB, 0xCD, 0x12, 0x34};
+#define WIDTH 240
+#define HEIGHT 240
+#define ROWS_PER_PACKET 120
+#define PIXEL_SIZE 2 // 16 bits per pixel
+#define FRAME_DELAY pdMS_TO_TICKS(200)
+#define PACKET_DELAY pdMS_TO_TICKS(4)
 
-void HSVtoRGB(float hue, float saturation, float value, uint16_t *red, uint16_t *green, uint16_t *blue);
+#define EXAMPLE_ESP_WIFI_SSID "our-wifi"
+#define EXAMPLE_ESP_WIFI_PASS "bearthecat"
 
-void app_main() {
-    uart_config_t uart_config = {
-        .baud_rate = 115200,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+static const char *TAG = "wifi station";
+
+static void event_handler(void* arg, esp_event_base_t event_base,
+                                int32_t event_id, void* event_data) {
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGI(TAG, "retry to connect to the AP");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
+        ESP_LOGI(TAG, "got ip:%s", ip4addr_ntoa((ip4_addr_t*)&event->ip_info.ip.addr));
+    }
+}
+
+void wifi_init_sta(void) {
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&cfg);
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id);
+    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip);
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = EXAMPLE_ESP_WIFI_SSID,
+            .password = EXAMPLE_ESP_WIFI_PASS,
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+        },
     };
-    uart_param_config(UART_NUM_0, &uart_config);
-    uart_driver_install(UART_NUM_0, BUFFER_SIZE, 0, 0, NULL, 0);
+    esp_wifi_set_mode(WIFI_MODE_STA);
+    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
+    esp_wifi_start();
+}
 
-    int hue_increment = 360 / SCREEN_HEIGHT;
 
-    while(1) {
-        // send the header
-        uart_write_bytes(UART_NUM_0, (const char*)header, sizeof(header));
-        
-        for (int y = 0; y < SCREEN_HEIGHT; y++) {
-            uint16_t color_data[SCREEN_WIDTH];
-            float hue = (hue_increment * y) % 360;
 
-            uint16_t red, green, blue;
-            HSVtoRGB(hue, 100.0, 100.0, &red, &green, &blue);
-            // combine into one number 5 bits of red, 6 bits of green, and 5 bits of blue
-            uint16_t color = ((red & 0xF8) << 8) | ((green & 0xFC) << 3) | (blue >> 3);
-            for (int x = 0; x < SCREEN_WIDTH; x++) {
-                color_data[x] = color;
-            }
+static void tcp_server_task(void *pvParameters) {
+    struct netconn *conn, *newconn;
+    err_t err;
+    uint16_t pixel_data[WIDTH * ROWS_PER_PACKET];  // Buffer for 4 rows of pixel data
+    uint16_t color_offset = 0;
 
-            uart_write_bytes(UART_NUM_0, (const char*)&color_data, sizeof(color_data));
+    conn = netconn_new(NETCONN_TCP);
+    if (!conn) {
+        ESP_LOGE(TAG, "Failed to create new connection");
+        vTaskDelete(NULL);  // Terminate this task if connection cannot be created
+    }
+
+    err = netconn_bind(conn, NULL, 80);
+    if (err != ERR_OK) {
+        ESP_LOGE(TAG, "Binding failed: %s", lwip_strerr(err));
+        netconn_delete(conn);
+        vTaskDelete(NULL);  // Terminate this task if binding fails
+    }
+    netconn_listen(conn);
+
+    while (true) {
+        err = netconn_accept(conn, &newconn);
+        if (err != ERR_OK) {
+            ESP_LOGE(TAG, "Accept failed: %s", lwip_strerr(err));
+            continue;  // Skip to next iteration to accept a new connection
         }
-        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // Connection established, send data until an error occurs
+        while (true) {
+            for (int y = 0; y < HEIGHT; y += ROWS_PER_PACKET) {
+                for (int row = 0; row < ROWS_PER_PACKET; row++) {
+                    for (int x = 0; x < WIDTH; x++) {
+                        // Calculate color index based on the width of the bars
+                        int color_index = ((x + color_offset) / 10) % 3;
+                        uint16_t color = (color_index == 0) ? 0x0000 :
+                                         (color_index == 1) ? 0xFFFF :
+                                         0xF800; // Red
+                        pixel_data[row * WIDTH + x] = color;
+                    }
+                }
+                err = netconn_write(newconn, pixel_data, WIDTH * ROWS_PER_PACKET * PIXEL_SIZE, NETCONN_COPY);
+                if (err != ERR_OK) {
+                    ESP_LOGE(TAG, "Write failed: %s", lwip_strerr(err));
+                    break;  // Break from the write loop on error
+                }
+                ESP_LOGI(TAG, "Sent row: %d", y);
+                vTaskDelay(PACKET_DELAY);
+            }
+            if (err != ERR_OK) break;  // Exit the connection loop on write error
+            color_offset = (color_offset + 1) % 30;  // Move the bars to the right, reset after 30 pixels
+            vTaskDelay(FRAME_DELAY);
+        }
+
+        netconn_close(newconn);
+        netconn_delete(newconn);
     }
+
+    // Clean up connection objects if the loop exits (which in this case, it shouldn't)
+    netconn_close(conn);
+    netconn_delete(conn);
 }
 
 
-/**
- * Retreived then modified from https://github.com/Inseckto/HSV-to-RGB/blob/master/HSV2RGB.c
-*/
-void HSVtoRGB(float hue, float saturation, float value, uint16_t *red, uint16_t *green, uint16_t *blue) {
-    float r = 0, g = 0, b = 0;
 
-    float h = hue / 360;
-    float s = saturation / 100;
-    float v = value / 100;
-    
-    int i = floor(h * 6);
-    float f = h * 6 - i;
-    float p = v * (1 - s);
-    float q = v * (1 - f * s);
-    float t = v * (1 - (1 - f) * s);
-    
-    switch (i % 6) {
-        case 0: r = v, g = t, b = p; break;
-        case 1: r = q, g = v, b = p; break;
-        case 2: r = p, g = v, b = t; break;
-        case 3: r = p, g = q, b = v; break;
-        case 4: r = t, g = p, b = v; break;
-        case 5: r = v, g = p, b = q; break;
-    }
-    
-    *red = (uint16_t)(r * 255);
-    *green = (uint16_t)(g * 255);
-    *blue = (uint16_t)(b * 255);
+void app_main(void) {
+    nvs_flash_init();
+    wifi_init_sta();
+    xTaskCreate(tcp_server_task, "tcp_server", 65520, NULL, 5, NULL);
 }
-
